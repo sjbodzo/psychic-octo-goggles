@@ -1,0 +1,90 @@
+name: SBOM
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  IN_TOTO_LINK_CMD_EXEC_TIMEOUT: 60
+  IMAGE_TAG: "${{ secrets.DOCKER_REGISTRY_HOST }}/demo/sample:${{ github.sha }}"
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Init
+        id: init
+        run: |
+          sudo apt -qq update -y && sudo apt -qq install -y python3.8 python3-pip
+          
+          curl -sL https://github.com/anchore/syft/releases/download/v0.36.0/syft_0.36.0_linux_amd64.deb -o syft.deb && sudo apt -qq install -y ./syft.deb && rm syft.deb
+          curl -sL https://github.com/sigstore/cosign/releases/download/v1.5.0/cosign-linux-amd64 -o cosign && chmod +x cosign && mv cosign /usr/local/bin/
+          curl -sL https://github.com/in-toto/in-toto/releases/download/v1.1.1/in_toto-1.1.1-py3-none-any.whl -O && pip3 install in_toto-1.1.1-py3-none-any.whl && rm in_toto-1.1.1-py3-none-any.whl
+          curl -sL https://go.dev/dl/go1.17.6.linux-amd64.tar.gz -O && sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf go1.17.6.linux-amd64.tar.gz && export PATH=$PATH:/usr/local/go/bin && rm go1.17.6.linux-amd64.tar.gz
+
+          mkdir keys
+          cat <<< "${{secrets.BOB_SECRET_KEY}}" > keys/bob
+          cat <<< "${{secrets.CARL_SECRET_KEY}}" > keys/carl
+          cat <<< "${{secrets.ALICE_PUBLIC_KEY}}" > keys/alice.pub
+
+          docker login -u "${{secrets.DOCKER_REGISTRY_USER}}" -p "${{secrets.DOCKER_REGISTRY_PASS}}" "${{secrets.DOCKER_REGISTRY_HOST}}"
+
+      - name: Clone the repo 
+        run: |
+          in-toto-run -n clone --key keys/bob -P "${{secrets.BOB_SECRET_PASS}}" -p "./*" -- /bin/sh -c "git clone https://${{secrets.CLONE_TOKEN}}@github.com/${GITHUB_REPOSITORY}.git out && cd out && git reset --hard ${GITHUB_SHA} && mv ./* ../ && rm -rf out && cd .."
+      - name: Build app
+        run: |
+          in-toto-run -n build --key keys/carl -P "${{secrets.CARL_SECRET_PASS}}" -m "./" -p build/sample -- go build -o build/sample "src/main.go" 
+      - name: Upload golang binary
+        uses: actions/upload-artifact@v2
+        with: 
+          name: sample
+          path: build/sample
+      - name: Build container
+        run: |
+          in-toto-run -n docker_build --key keys/carl -P "${{secrets.CARL_SECRET_PASS}}" -m "./" -- docker build --file Dockerfile --tag ${IMAGE_TAG} . 
+      - uses: anchore/scan-action@v3
+        id: scan
+        with:
+          image: ${{ env.IMAGE_TAG }}
+          fail-build: true
+      - name: Inspect action SARIF report
+        run: cat ${{ steps.scan.outputs.sarif }}
+      - name: Generate SBOM 
+        run: |
+          in-toto-run -n sbom_gen --key keys/bob -P "${{secrets.BOB_SECRET_PASS}}" -p ./sbom.json -- /bin/sh -c "syft packages ${IMAGE_TAG} -o cyclonedx-json > sbom.json"
+      - name: Upload sbom
+        uses: actions/upload-artifact@v2
+        with: 
+          name: cyclonedx-sbom.json
+          path: sbom.json
+      - name: Push image
+        run: |
+          in-toto-run -n docker_push --key keys/bob -P "${{secrets.BOB_SECRET_PASS}}" -m "./" -- docker push ${IMAGE_TAG}
+      - name: Sign image
+        run: |
+          in-toto-run -n oci_sign --key keys/bob -P "${{secrets.BOB_SECRET_PASS}}" -p sig -- cosign sign ${IMAGE_TAG} --key ./cosign.key --output-signature=./sig
+        env:
+          COSIGN_PASSWORD: foo
+      - name: Upload container signature
+        uses: actions/upload-artifact@v2
+        with: 
+          name: oci-sig
+          path: ./sig
+      - name: Verify in-toto layout file
+        run: |
+          rm -rf verify && mkdir verify
+          cp *.link root.layout keys/alice.pub verify/
+          cd verify && in-toto-verify --layout root.layout --layout-key alice.pub && cd ../
+      - name: Generate SLSA build provenance
+        uses: philips-labs/slsa-provenance-action@v0.5.0
+        with: 
+          command: generate
+          subcommand: files
+          arguments: --artifact-path build/sample
+      - name: Upload provenance
+        uses: actions/upload-artifact@v2
+        with: 
+          name: provenance.json
+          path: provenance.json
